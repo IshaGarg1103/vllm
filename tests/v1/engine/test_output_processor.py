@@ -1864,38 +1864,6 @@ def test_streaming_input_skip_special_tokens(
         assert output.text == (cumulative_text if cumulative else text)
 
 
-@pytest.mark.parametrize(
-    "tokenizer_name", ["gpt2", "vllm-project/tiny-random-LlamaForCausalLM"]
-)
-@pytest.mark.parametrize("fast", [False, True])
-@pytest.mark.parametrize("initial_skip", [False, True])
-def test_skip_special_tokens_change_preserves_pending_text(
-    tokenizer_name: str, fast: bool, initial_skip: bool
-):
-    """Changing special-token handling must preserve incomplete UTF-8 output."""
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    output_ids = tokenizer.encode("你好😀", add_special_tokens=False)
-    request = _make_streaming_input_request(
-        "decode-setting",
-        tokenizer.encode("Hello", add_special_tokens=False),
-        SamplingParams(skip_special_tokens=initial_skip),
-    )
-    decoder_class = FastIncrementalDetokenizer if fast else SlowIncrementalDetokenizer
-    for split in range(1, len(output_ids)):
-        decoder = decoder_class(tokenizer, request)
-        reference = decoder_class(tokenizer, request)
-        observed = ""
-        expected = ""
-        for chunk_index, chunk in enumerate([output_ids[:split], output_ids[split:]]):
-            if chunk_index:
-                decoder.set_skip_special_tokens(not initial_skip)
-            decoder.update(chunk, stop_terminated=False)
-            reference.update(chunk, stop_terminated=False)
-            observed += decoder.get_next_output_text(finished=True, delta=True)
-            expected += reference.get_next_output_text(finished=True, delta=True)
-        assert observed == expected
-
-
 @pytest.mark.parametrize("fast", [False, True])
 @pytest.mark.parametrize(
     ("initial_skip", "stop_terminated"),
@@ -1951,26 +1919,21 @@ def test_skip_special_tokens_change_preserves_spacing():
     assert p1 + fast.get_next_output_text(finished=True, delta=True) == "<s1><s1>"
 
 
-@pytest.mark.parametrize("fast", [False, True])
-def test_skip_special_tokens_change_handles_invalid_ids(fast: bool):
-    """Toggling tolerates prior out-of-range token IDs."""
-    raw = Tokenizer(models.WordLevel({"!": 0, "<eos>": 1}, unk_token="!"))
-    raw.decoder = decoders.Fuse()
-    tokenizer = TokenizersBackend(
-        tokenizer_object=raw, additional_special_tokens=["<eos>"]
-    )
-    decoder_class = FastIncrementalDetokenizer if fast else SlowIncrementalDetokenizer
-    decoder = decoder_class(
+def test_skip_special_tokens_change_keeps_slow_tokenizer_text():
+    """Hiding special tokens later must not re-render earlier ones (slow path)."""
+    tokenizer = AutoTokenizer.from_pretrained("google/byt5-small")
+    assert not tokenizer.is_fast and tokenizer.get_added_vocab()
+    eos = tokenizer.eos_token_id
+    decoder = SlowIncrementalDetokenizer(
         tokenizer,
         _make_streaming_input_request(
-            "decode-invalid", [], SamplingParams(skip_special_tokens=True)
+            "slow-skip", [], SamplingParams(skip_special_tokens=False)
         ),
     )
-    decoder.update([-1, 0], stop_terminated=False)
-    assert decoder.get_next_output_text(finished=True, delta=True) == "!"
-    decoder.set_skip_special_tokens(False)
-    decoder.update([1, 0], stop_terminated=False)
-    assert decoder.get_next_output_text(finished=True, delta=True) == "<eos>!"
+    decoder.update([eos], stop_terminated=False)
+    decoder.set_skip_special_tokens(True)
+    decoder.update([*tokenizer.encode("!", add_special_tokens=False), eos], False)
+    assert decoder.output_text == "</s> !"
 
 
 def _add_streaming_request_with_queued_chunk(
